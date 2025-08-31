@@ -144,7 +144,7 @@ def main():
         epochs=10, batch_size=8, num_workers=8,
         num_samples=8, size=224,
 
-        lr_head=1e-4,         # faster learning for frozen backbone
+        lr_head=1e-4,
         lr_backbone=5e-5,
         weight_decay=0.05,
         grad_clip=1.0,

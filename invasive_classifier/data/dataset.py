@@ -10,6 +10,8 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 
 
+# -------------------- helpers --------------------
+
 def boxes_from_points(points: List[Tuple[int,int,int]], pad=12, W=None, H=None):
     by_f = defaultdict(list)
     for x, y, f in points:
@@ -44,8 +46,11 @@ def uniform_indices(frames: List[int], num: int) -> List[int]:
     return [frames[round(i*(len(frames)-1)/(num-1))] for i in range(num)]
 
 
+# ImageNet normalization (DINOv3/ViT)
 IMAGENET_NORM = T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
 
+
+# -------------------- dataset --------------------
 
 class NZThermalTracksNoFiltered(Dataset):
     """
@@ -53,6 +58,7 @@ class NZThermalTracksNoFiltered(Dataset):
       videos/                 # <id>.mp4 (we ignore *_filtered.mp4)
       individual-metadata/    # <id>_metadata.json (with 'points')
       new-zealand-wildlife-thermal-imaging.json (optional)
+
     Returns:
       x: [T, 3, H, W] (float32, ImageNet-normalized if normalize='imagenet')
       y: int64
@@ -70,6 +76,7 @@ class NZThermalTracksNoFiltered(Dataset):
         pad: int = 12,
         drop_calibration_frames: bool = True,
         normalize: str = "imagenet",   # "imagenet" or "none"
+        use_bboxes: bool = False       # <--- NEW: off by default (use full frame)
     ):
         self.root = root
         self.vdir = os.path.join(root, "videos")
@@ -77,6 +84,7 @@ class NZThermalTracksNoFiltered(Dataset):
         self.num_samples, self.size = num_samples, size
         self.pad = pad
         self.drop_calibration_frames = drop_calibration_frames
+        self.use_bboxes = use_bboxes
 
         norm = (normalize or "none").lower()
         if norm == "imagenet":
@@ -90,6 +98,7 @@ class NZThermalTracksNoFiltered(Dataset):
         if not metas:
             raise FileNotFoundError("No *_metadata.json found in individual-metadata/")
 
+        # build label_map if not given
         if label_map is None:
             seen = []
             for p in metas[:5000]:
@@ -107,6 +116,7 @@ class NZThermalTracksNoFiltered(Dataset):
         else:
             self.label_map = label_map
 
+        # index items
         self.items = []
         for p in metas:
             try:
@@ -156,6 +166,7 @@ class NZThermalTracksNoFiltered(Dataset):
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(fidx))
         ok, frame = cap.read()
         if not ok: return None
+        # grayscale -> replicate to 3 channels (model expects 3ch)
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         frame = np.stack([frame, frame, frame], axis=2)  # H,W,3
         return frame
@@ -172,9 +183,16 @@ class NZThermalTracksNoFiltered(Dataset):
             frame = self._read_frame(cap, f)
             if frame is None:
                 frame = np.zeros((it["H"], it["W"], 3), dtype=np.uint8)
-            x1,y1,x2,y2 = it["boxes"].get(f, it["boxes"][it["frames"][0]])
-            crop = frame[y1:y2, x1:x2]
-            if crop.size == 0: crop = frame
+
+            # --- NEW: bbox use is optional ---
+            if self.use_bboxes:
+                x1,y1,x2,y2 = it["boxes"].get(f, (0,0,it["W"],it["H"]))
+                crop = frame[y1:y2, x1:x2]
+                if crop.size == 0:
+                    crop = frame
+            else:
+                crop = frame  # use full frame
+
             crop = cv2.resize(crop, (self.size, self.size), interpolation=cv2.INTER_AREA)
             crop = crop.astype(np.float32) / 255.0
             tensor = torch.from_numpy(crop).permute(2,0,1)  # [3,H,W] in [0,1]
@@ -185,10 +203,17 @@ class NZThermalTracksNoFiltered(Dataset):
 
         x = torch.stack(crops, 0)  # [T,3,H,W]
         y = torch.tensor(it["label_id"]).long()
-        meta = {"label_str": it["label_str"], "clip_id": it["clip_id"],
-                "track_index": it["track_index"], "video_path": it["video"]}
+        meta = {
+            "label_str": it["label_str"],
+            "clip_id": it["clip_id"],
+            "track_index": it["track_index"],
+            "video_path": it["video"],
+            "frames": idxs,            # helpful for debug panels
+        }
         return x, y, meta
 
+
+# -------------------- loader factory --------------------
 
 def make_loader(root, batch_size=8, num_workers=4, **kwargs):
     ds = NZThermalTracksNoFiltered(root, **kwargs)
