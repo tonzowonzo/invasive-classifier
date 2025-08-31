@@ -5,8 +5,6 @@ This repository contains code and training utilities for building a **track-leve
 The goal is to support conservation by automatically detecting and classifying animals in thermal footage, enabling better monitoring and control of invasive species.
 
 ---
-<img width="1536" height="1024" alt="dino_view" src="https://github.com/user-attachments/assets/3baad5e7-3736-4673-9cd8-c54434b5f2b7" />
----
 
 ## Dataset
 
