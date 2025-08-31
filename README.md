@@ -7,6 +7,7 @@ The goal is to support conservation by automatically detecting and classifying a
 ---
 <img width="1536" height="1024" alt="dino_view" src="https://github.com/user-attachments/assets/3baad5e7-3736-4673-9cd8-c54434b5f2b7" />
 ---
+
 ## Dataset
 
 We use the public **NZ Thermal Wildlife dataset**:
