@@ -12,6 +12,7 @@ opencv-python-headless = "^4.12.0.88"
 matplotlib = "^3.10.6"
 pandas = "^2.3.2"
 tensorboard = "^2.20.0"
+tqdm = "^4.67.1"
 
 
 [tool.poetry.group.dev.dependencies]

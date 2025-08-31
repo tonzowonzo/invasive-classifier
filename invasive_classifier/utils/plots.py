@@ -10,28 +10,30 @@ import matplotlib.pyplot as plt
 
 def show_track_crops(track_tensor: torch.Tensor, label: str = "", max_cols: int = 8):
     """
-    Visualize the crops sampled from one track.
+    Build a matplotlib Figure showing crops from one track.
+    DOES NOT call plt.show(); caller should save/close the figure.
     Args:
-        track_tensor: torch.Tensor [T,C,H,W], values in [0,1]
-        label: optional string to display as title
-        max_cols: number of images per row
+        track_tensor: [T, C, H, W] in [0,1]
+        label: optional title
+        max_cols: images per row
+    Returns:
+        fig (matplotlib.figure.Figure)
     """
     t, c, h, w = track_tensor.shape
-    cols = min(max_cols, t)
-    rows = int(np.ceil(t / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(cols*2, rows*2))
+    cols = min(max_cols, t if t > 0 else 1)
+    rows = int(np.ceil(t / cols)) if t > 0 else 1
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 2, rows * 2))
     axes = np.atleast_1d(axes).flatten()
-    for i in range(rows*cols):
-        ax = axes[i]
+    for i, ax in enumerate(axes):
         ax.axis("off")
         if i < t:
-            img = track_tensor[i].permute(1,2,0).cpu().numpy()
+            img = track_tensor[i].permute(1, 2, 0).cpu().numpy()
             ax.imshow(img)
             ax.set_title(f"f{i}", fontsize=8)
     if label:
-        fig.suptitle(f"Track crops – {label}", fontsize=12)
-    plt.tight_layout()
-    plt.show()
+        fig.suptitle(label, fontsize=12)
+    fig.tight_layout()
+    return fig
 
 
 def show_video_with_boxes(video_path: str,
