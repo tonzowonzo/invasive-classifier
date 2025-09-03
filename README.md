@@ -1,5 +1,7 @@
 # Invasive Species Classifier (Thermal Video, New Zealand Wildlife)
 
+This is a WIP - I'll likely change the architecture significantly.
+
 This repository contains code and training utilities for building a **track-level classifier** of invasive species (e.g., possums, rodents, cats, hedgehogs) using thermal camera trap videos from **[The Cacophony Project](https://cacophony.org.nz/)**.  
 
 The goal is to support conservation by automatically detecting and classifying animals in thermal footage, enabling better monitoring and control of invasive species.
