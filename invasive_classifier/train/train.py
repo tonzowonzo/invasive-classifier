@@ -1,8 +1,7 @@
+# invasive_classifier/train/train.py
 import os
 import time
-import json
-from collections import Counter, defaultdict
-from typing import Dict, Set, Tuple, List
+from collections import Counter
 
 import torch
 import torch.nn as nn
@@ -11,22 +10,21 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
-
+# --- Refactored Imports ---
+from invasive_classifier.config import get_config, get_class_mapping
+from invasive_classifier.data.data_utils import (
+    apply_class_mapping,
+    load_split_ids,
+    scan_labels_in_split,
+)
+from invasive_classifier.train.train_utils import evaluate, log_debug_plots
 from invasive_classifier.model.track_classifier import build_dinov3_detector
 from invasive_classifier.data.dataset_invasive import make_loader
-from invasive_classifier.utils import plots
-
-
-# ---------------- helpers ----------------
 
 
 def set_seed(seed=1337):
     import random
+    import numpy as np
 
     random.seed(seed)
     np.random.seed(seed)
@@ -34,255 +32,29 @@ def set_seed(seed=1337):
     torch.cuda.manual_seed_all(seed)
 
 
-def apply_class_mapping(counts: Counter, mapping: Dict[str, str]) -> Counter:
-    new_counts = Counter()
-    for label, count in counts.items():
-        new_label = mapping.get(label, label)
-        new_counts[new_label] += count
-    return new_counts
-
-
-def load_split_ids(path: str) -> Tuple[Set[int], Set[int]]:
-    def extract_ids(obj) -> Set[int]:
-        out = set()
-
-        def visit(x):
-            if x is None:
-                return
-            if isinstance(x, (list, tuple, set)):
-                for xi in x:
-                    visit(xi)
-            elif isinstance(x, dict):
-                for k in ("id", "clip_id", "clip", "clipId"):
-                    if k in x:
-                        try:
-                            out.add(int(x[k]))
-                            return
-                        except Exception:
-                            pass
-                for v in x.values():
-                    visit(v)
-            else:
-                try:
-                    out.add(int(x))
-                except Exception:
-                    pass
-
-        visit(obj)
-        return out
-
-    with open(path, "r") as f:
-        data = json.load(f)
-
-    def pick(keys):
-        for k in keys:
-            if k in data:
-                ids = extract_ids(data[k])
-                if ids:
-                    return ids
-        return set()
-
-    train_ids = pick(["train", "train_ids", "train_clip_ids", "train_clips"])
-    val_ids = pick(["val", "validation", "val_ids", "valid_ids", "validation_ids"])
-    test_ids = pick(["test", "test_ids", "test_clip_ids", "test_clips"])
-    eval_ids = val_ids if val_ids else test_ids
-    if not train_ids or not eval_ids:
-        raise ValueError(
-            f"Bad splits json: train={len(train_ids)} eval={len(eval_ids)}"
-        )
-    return train_ids, eval_ids
-
-
-def choose_label(tags: List[Dict]) -> str | None:
-    if not tags:
-        return None
-    labs = [t.get("label") for t in tags if t.get("label")]
-    if not labs:
-        return None
-    counts = Counter(labs).most_common()
-    # --- FIX: Renamed 'l' to 'lab' ---
-    tied = [lab for lab, c in counts if c == counts[0][1]]
-    if len(tied) == 1:
-        return tied[0]
-    # --- FIX: Renamed 'l' to 'lab' ---
-    conf = {
-        lab: sum(t.get("confidence", 0.0) for t in tags if t.get("label") == lab)
-        for lab in tied
-    }
-    return max(conf, key=conf.get)
-
-
-def scan_labels_in_split(indiv_meta_dir: str, clip_ids: Set[int]) -> Counter:
-    cnt = Counter()
-    for cid in tqdm(clip_ids, desc="Scanning labels"):
-        p = os.path.join(indiv_meta_dir, f"{cid}_metadata.json")
-        if not os.path.exists(p):
-            continue
-        try:
-            m = json.load(open(p))
-            for tr in m.get("tracks", []):
-                lab = choose_label(tr.get("tags", []))
-                if lab:
-                    cnt[lab] += 1
-        except Exception:
-            pass
-    return cnt
-
-
-def macro_f1_from_counts(tp, fp, fn, eps=1e-9):
-    f1s = []
-    for c in tp.keys():
-        p = tp[c] / (tp[c] + fp[c] + eps)
-        r = tp[c] / (tp[c] + fn[c] + eps)
-        f1s.append(2 * p * r / (p + r + eps))
-    return sum(f1s) / max(1, len(f1s))
-
-
-def evaluate(model, loader, device, label_map, writer=None, step=0, save_dir=None):
-    model.eval()
-    ce = nn.CrossEntropyLoss(reduction="sum")
-    loss_sum, n = 0.0, 0
-    tp, fp, fn = defaultdict(int), defaultdict(int), defaultdict(int)
-
-    with torch.no_grad():
-        for xb, yb, meta in tqdm(loader, desc="Evaluating", ncols=100):
-            xb = xb.to(device).float()
-            yb = yb.to(device)
-            B, T, C, H, W = xb.shape
-
-            xb_frames = xb.view(B * T, C, H, W)
-            predictions = model(xb_frames)
-            pred_logits = predictions["pred_logits"]
-            clip_logits = (
-                pred_logits.view(B, T, pred_logits.shape[1], -1)
-                .max(dim=2)
-                .values.max(dim=1)
-                .values
-            )
-            clip_logits = clip_logits[:, :-1]
-
-            loss_sum += ce(clip_logits, yb).item()
-            n += yb.size(0)
-            pred = clip_logits.argmax(1)
-            for t, p in zip(yb.tolist(), pred.tolist()):
-                if t == p:
-                    tp[t] += 1
-                else:
-                    fp[p] += 1
-                    fn[t] += 1
-
-    avg_loss = loss_sum / max(1, n)
-    mf1 = macro_f1_from_counts(tp, fp, fn)
-
-    if writer:
-        writer.add_scalar("eval/loss", avg_loss, step)
-        writer.add_scalar("eval/macro_f1", mf1, step)
-
-    if save_dir:
-        inv = {v: k for k, v in label_map.items()}
-        class_f1 = {}
-        for c in inv:
-            p = tp[c] / (tp[c] + fp[c] + 1e-9)
-            r = tp[c] / (tp[c] + fn[c] + 1e-9)
-            class_f1[inv[c]] = 2 * p * r / (p + r + 1e-9)
-        os.makedirs(save_dir, exist_ok=True)
-        with open(os.path.join(save_dir, f"class_f1_step{step}.json"), "w") as f:
-            json.dump(class_f1, f, indent=2)
-    return avg_loss, mf1
-
-
-# ---------------- training ----------------
-
-
 def main():
-    CFG = dict(
-        root="/home/timiles/tim/invasive-classifier/nz_thermal_data",
-        splits_path="/home/timiles/tim/invasive-classifier/nz_thermal_data/new-zealand-wildlife-thermal-imaging-splits.json",
-        local_ckpt="dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
-        out="artifacts_detector_merged",
-        logdir="runs/invasive_detector_merged",
-        epochs=10,
-        batch_size=4,
-        num_workers=8,
-        num_samples=8,
-        size=224,
-        lr_head=1e-4,
-        lr_backbone=5e-5,
-        weight_decay=0.05,
-        grad_clip=1.0,
-        unfreeze_last_n_blocks=0,
-        use_weighted_sampler=True,
-        debug_every_steps=250,
-    )
-
-    def class_names_from_map(label_map: Dict[str, int]):
-        return [k for k, _ in sorted(label_map.items(), key=lambda kv: kv[1])]
-
-    def find_dataset_item(ds, clip_id, track_index, video_path):
-        for it in ds.items:
-            if (
-                it["clip_id"] == clip_id
-                and it["track_index"] == track_index
-                and it["video"] == video_path
-            ):
-                return it
-        return None
-
+    CFG = get_config()
     set_seed(1337)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(CFG["out"], exist_ok=True)
     os.makedirs(os.path.join(CFG["out"], "debug_plots"), exist_ok=True)
 
+    # --- 1. Setup Labels and Classes ---
     train_ids, eval_ids = load_split_ids(CFG["splits_path"])
     indiv_dir = os.path.join(CFG["root"], "individual-metadata")
-
     train_cnt_raw = scan_labels_in_split(indiv_dir, train_ids)
-
-    class_mapping = {
-        "mouse": "rodent",
-        "rat": "rodent",
-        "rabbit": "leporidae",
-        "hare": "leporidae",
-        "stoat": "mustelid",
-        "ferret": "mustelid",
-        "deer": "large_animal",
-        "goat": "large_animal",
-        "sheep": "large_animal",
-        "wallaby": "large_animal",
-        "pig": "large_animal",
-        "sealion": "large_animal",
-        "unidentified": "unidentified/other",
-        "other": "unidentified/other",
-        "poor tracking": "unidentified/other",
-        "lizard": "unidentified/other",
-        "kiwi": "bird_ground_large",
-        "north island brown kiwi": "bird_ground_large",
-        "little spotted kiwi": "bird_ground_large",
-        "pukeko": "bird_ground_large",
-        "chicken": "bird_ground_large",
-        "penguin": "bird_ground_large",
-        "black swan": "bird_waterfowl",
-        "duck": "bird_waterfowl",
-        "brown teal": "bird_waterfowl",
-        "brown quail": "bird_small_other",
-        "pheasant": "bird_small_other",
-        "new zealand fantail": "bird_small_other",
-        "song thrush": "bird_small_other",
-        "california quail": "bird_small_other",
-        "partridge": "bird_small_other",
-        "quail": "bird_small_other",
-        "morepork": "bird_small_other",
-    }
+    class_mapping = get_class_mapping()
     train_cnt = apply_class_mapping(train_cnt_raw, class_mapping)
     print("[labels] Applied class mapping to consolidate classes.")
 
-    train_seen = set(train_cnt.keys())
-    active_classes = sorted(list(train_seen))
+    active_classes = sorted(list(train_cnt.keys()))
     label_map = {c: i for i, c in enumerate(active_classes)}
-    class_names = class_names_from_map(label_map)
+    class_names = [k for k, _ in sorted(label_map.items(), key=lambda kv: kv[1])]
     print(f"[labels] Active classes after merging: {len(label_map)}")
     print(f"[labels] active: {class_names}")
 
+    # --- 2. Setup Dataloaders ---
     train_loader, _ = make_loader(
         CFG["root"],
         batch_size=CFG["batch_size"],
@@ -294,6 +66,7 @@ def main():
         label_map=label_map,
         class_mapping=class_mapping,
     )
+
     eval_loader, _ = make_loader(
         CFG["root"],
         batch_size=max(1, CFG["batch_size"] // 2),
@@ -325,39 +98,38 @@ def main():
                 pin_memory=True,
             )
 
+    # --- 3. Setup Model, Optimizer, and Loss ---
     model = build_dinov3_detector(
         num_classes=len(label_map),
         backbone_name="vit_base_patch16_224",
+        in_channels=3,
         local_checkpoint=CFG["local_ckpt"],
         unfreeze_last_n_blocks=CFG["unfreeze_last_n_blocks"],
     ).to(device)
 
     back_params = [p for p in model.backbone.parameters() if p.requires_grad]
     head_params = [p for p in model.detection_head.parameters() if p.requires_grad]
-    groups = []
-    if back_params:
-        groups.append({"params": back_params, "lr": CFG["lr_backbone"]})
-    if head_params:
-        groups.append({"params": head_params, "lr": CFG["lr_head"]})
+    groups = [
+        {"params": back_params, "lr": CFG["lr_backbone"]},
+        {"params": head_params, "lr": CFG["lr_head"]},
+    ]
     optimizer = optim.AdamW(groups, weight_decay=CFG["weight_decay"])
     sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CFG["epochs"])
     scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
     criterion = nn.CrossEntropyLoss()
 
+    # --- 4. Training Loop ---
     writer = SummaryWriter(CFG["logdir"])
     best_f1 = -1.0
     global_step = 0
     for epoch in range(1, CFG["epochs"] + 1):
         model.train()
         t0 = time.time()
-        ep_loss = 0
-        ep_acc = 0
-        seen = 0
+        ep_loss, ep_acc, seen = 0, 0, 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{CFG['epochs']}", ncols=120)
         for xb, yb, meta in pbar:
-            xb = xb.to(device).float()
-            yb = yb.to(device)
+            xb, yb = xb.to(device).float(), yb.to(device)
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=(device == "cuda")):
                 B, T, C, H, W = xb.shape
@@ -385,108 +157,30 @@ def main():
             ep_acc += (clip_logits.argmax(1) == yb).sum().item()
             seen += bs
 
-            curr_loss = ep_loss / max(1, seen)
-            curr_acc = ep_acc / max(1, seen)
             lrs = [g["lr"] for g in optimizer.param_groups]
             pbar.set_postfix(
-                loss=f"{curr_loss:.4f}",
-                acc=f"{curr_acc:.3f}",
+                loss=f"{ep_loss/max(1,seen):.4f}",
+                acc=f"{ep_acc/max(1,seen):.3f}",
                 lr="/".join(f"{lr:.2e}" for lr in lrs),
             )
 
             if global_step % 10 == 0:
                 writer.add_scalar("train/loss", float(loss.item()), global_step)
-                for i, g in enumerate(optimizer.param_groups):
-                    writer.add_scalar(f"train/lr_group{i}", g["lr"], global_step)
 
             if global_step > 0 and global_step % CFG["debug_every_steps"] == 0:
-                save_dir = os.path.join(CFG["out"], "debug_plots")
-                pred_idx = int(clip_logits[0].argmax().item())
-                fig1 = plots.show_track_crops(
-                    xb[0].detach().cpu(),
-                    label=f"GT: {meta['label_str'][0]} | pred: {class_names[pred_idx]}",
-                    denorm=True,
-                )
-                fig1.savefig(
-                    os.path.join(save_dir, f"crops_e{epoch}_s{global_step}.png"),
-                    dpi=120,
-                )
-                writer.add_figure("debug/crops", fig1, global_step)
-                plt.close(fig1)
-
-                fig2 = plots.batch_grid(
-                    xb.detach().cpu(),
-                    yb.detach().cpu(),
-                    clip_logits.detach().cpu(),
+                log_debug_plots(
+                    writer,
+                    xb,
+                    yb,
+                    clip_logits,
                     meta,
                     class_names,
-                    max_items=16,
-                    denorm=True,
-                    correct_only=False,
+                    train_loader,
+                    epoch,
+                    global_step,
+                    os.path.join(CFG["out"], "debug_plots"),
                 )
-                fig2.savefig(
-                    os.path.join(
-                        save_dir, f"batch_mistakes_e{epoch}_s{global_step}.png"
-                    ),
-                    dpi=120,
-                )
-                writer.add_figure("debug/batch_mistakes", fig2, global_step)
-                plt.close(fig2)
 
-                fig3 = plots.batch_grid(
-                    xb.detach().cpu(),
-                    yb.detach().cpu(),
-                    clip_logits.detach().cpu(),
-                    meta,
-                    class_names,
-                    max_items=16,
-                    denorm=True,
-                    correct_only=True,
-                )
-                fig3.savefig(
-                    os.path.join(
-                        save_dir, f"batch_correct_e{epoch}_s{global_step}.png"
-                    ),
-                    dpi=120,
-                )
-                writer.add_figure("debug/batch_correct", fig3, global_step)
-                plt.close(fig3)
-
-                try:
-                    item = find_dataset_item(
-                        train_loader.dataset,
-                        clip_id=meta["clip_id"][0],
-                        track_index=int(meta["track_index"][0]),
-                        video_path=meta["video_path"][0],
-                    )
-                    if item is not None:
-                        probs = (
-                            torch.softmax(clip_logits[0], dim=0).detach().cpu().numpy()
-                        )
-                        fig4 = plots.track_debug_panel(
-                            xb[0].detach().cpu(),
-                            meta={
-                                "label_str": meta["label_str"][0],
-                                "clip_id": int(meta["clip_id"][0]),
-                                "track_index": int(meta["track_index"][0]),
-                                "frames": item.get("frames", None),
-                            },
-                            class_probs=probs,
-                            class_names=class_names,
-                            video_path=item["video"],
-                            boxes=item["boxes"],
-                            denorm=True,
-                        )
-                        fig4.savefig(
-                            os.path.join(
-                                save_dir, f"track_panel_e{epoch}_s{global_step}.png"
-                            ),
-                            dpi=120,
-                        )
-                        writer.add_figure("debug/track_panel", fig4, global_step)
-                        plt.close(fig4)
-                except Exception as e:
-                    print(f"[debug] track panel failed: {e}")
             global_step += 1
 
         train_loss = ep_loss / max(1, seen)
@@ -499,25 +193,9 @@ def main():
             model, eval_loader, device, label_map, writer, global_step, CFG["out"]
         )
         print(
-            f"Epoch {epoch:02d} | train_loss={train_loss:.4f} acc={train_acc:.3f} "
-            f"| eval_loss={eval_loss:.4f} macro_f1={eval_f1:.3f} | time {time.time()-t0:.1f}s"
+            f"Epoch {epoch:02d} | train_loss={train_loss:.4f} acc={train_acc:.3f} | eval_loss={eval_loss:.4f} macro_f1={eval_f1:.3f} | time {time.time()-t0:.1f}s"
         )
 
-        last_path = os.path.join(CFG["out"], "last.ckpt")
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": sched.state_dict(),
-                "scaler": scaler.state_dict(),
-                "best_f1": best_f1,
-                "global_step": global_step,
-                "epoch": epoch,
-                "label_map": label_map,
-                "config": CFG,
-            },
-            last_path,
-        )
         if eval_f1 > best_f1:
             best_f1 = eval_f1
             torch.save(
