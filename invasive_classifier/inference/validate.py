@@ -1,13 +1,13 @@
-import os, json, math, time
-from typing import List, Dict, Tuple
-from collections import defaultdict
+import os
+import json
+from typing import List, Dict
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 
 # plotting (headless)
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -23,8 +23,10 @@ def load_split_ids(path):
     Accepts ints/strings or dicts with 'id'/'clip_id' fields; flattens nested containers.
     Prefers 'val' if present, else 'test'.
     """
+
     def extract_ids(obj):
         out = []
+
         def visit(x):
             if x is None:
                 return
@@ -46,6 +48,7 @@ def load_split_ids(path):
                     out.append(int(x))
                 except Exception:
                     pass
+
         visit(obj)
         return set(out)
 
@@ -61,16 +64,20 @@ def load_split_ids(path):
         return set()
 
     train_ids = pick(["train", "train_ids", "train_clip_ids", "train_clips"])
-    val_ids   = pick(["val", "validation", "val_ids", "valid_ids", "validation_ids"])
-    test_ids  = pick(["test", "test_ids", "test_clip_ids", "test_clips"])
-    eval_ids  = val_ids if val_ids else test_ids
+    val_ids = pick(["val", "validation", "val_ids", "valid_ids", "validation_ids"])
+    test_ids = pick(["test", "test_ids", "test_clip_ids", "test_clips"])
+    eval_ids = val_ids if val_ids else test_ids
     if not train_ids or not eval_ids:
-        raise ValueError(f"Could not extract non-empty train/eval ids from split file: {path}")
+        raise ValueError(
+            f"Could not extract non-empty train/eval ids from split file: {path}"
+        )
     return train_ids, eval_ids
 
 
 # ---------------- confusion matrix helpers ----------------
-def confusion_matrix(preds: np.ndarray, targets: np.ndarray, num_classes: int) -> np.ndarray:
+def confusion_matrix(
+    preds: np.ndarray, targets: np.ndarray, num_classes: int
+) -> np.ndarray:
     """
     Simple confusion matrix (counts). Shape [C, C] with rows = true, cols = pred.
     """
@@ -79,16 +86,22 @@ def confusion_matrix(preds: np.ndarray, targets: np.ndarray, num_classes: int) -
         cm[t, p] += 1
     return cm
 
-def plot_confusion_matrix(cm: np.ndarray, class_names: List[str], out_path: str, title: str = "Confusion matrix"):
+
+def plot_confusion_matrix(
+    cm: np.ndarray,
+    class_names: List[str],
+    out_path: str,
+    title: str = "Confusion matrix",
+):
     """
     cm: counts matrix [C,C]. We will annotate with normalized row percentages.
     """
     # normalize rows to percentages (avoid div by zero)
     row_sums = cm.sum(axis=1, keepdims=True).astype(np.float64)
-    norm = np.divide(cm, np.maximum(row_sums, 1), where=row_sums>0)
+    norm = np.divide(cm, np.maximum(row_sums, 1), where=row_sums > 0)
 
     fig = plt.figure(figsize=(10, 10), dpi=150)
-    im = plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    im = plt.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
     plt.title(title)
     plt.colorbar(im, fraction=0.046, pad=0.04)
     tick_marks = np.arange(len(class_names))
@@ -101,9 +114,15 @@ def plot_confusion_matrix(cm: np.ndarray, class_names: List[str], out_path: str,
         for j in range(cm.shape[1]):
             val = norm[i, j] * 100.0
             txt = f"{val:.0f}" if val >= 1.0 else ""  # show only >=1%
-            plt.text(j, i, txt,
-                     ha="center", va="center",
-                     color="white" if cm[i, j] > thresh else "black", fontsize=7)
+            plt.text(
+                j,
+                i,
+                txt,
+                ha="center",
+                va="center",
+                color="white" if cm[i, j] > thresh else "black",
+                fontsize=7,
+            )
 
     plt.ylabel("True label")
     plt.xlabel("Predicted label")
@@ -134,7 +153,9 @@ def main():
     # load checkpoint (for model + label_map)
     ckpt = torch.load(CFG["ckpt_path"], map_location="cpu")
     label_map: Dict[str, int] = ckpt["label_map"]
-    class_names = [k for k, _ in sorted(label_map.items(), key=lambda kv: kv[1])]  # index order
+    class_names = [
+        k for k, _ in sorted(label_map.items(), key=lambda kv: kv[1])
+    ]  # index order
     num_classes = len(class_names)
 
     # build model and load weights
@@ -142,7 +163,7 @@ def main():
         num_classes=num_classes,
         backbone_name="vit_base_patch16_224",
         temporal="meanmax",
-        freeze_backbone=True,               # as used in training
+        freeze_backbone=True,  # as used in training
         unfreeze_last_n_blocks=0,
         dropout=0.2,
         local_checkpoint=CFG["local_dinov3_ckpt"],
@@ -186,7 +207,7 @@ def main():
             all_tgts.append(yb.cpu().numpy())
 
     all_preds = np.concatenate(all_preds, axis=0)
-    all_tgts  = np.concatenate(all_tgts, axis=0)
+    all_tgts = np.concatenate(all_tgts, axis=0)
     avg_loss = loss_sum / max(1, n)
     acc = float((all_preds == all_tgts).mean())
     print(f"[validate] loss={avg_loss:.4f}  acc={acc:.3f}")
