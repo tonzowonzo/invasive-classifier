@@ -56,7 +56,7 @@ We use **Conda for system deps** (Python, PyTorch, CUDA) and **Poetry** for Pyth
 ### Conda env
 
 ```bash
-conda create -n invasive-classifier python=3.11 pytorch torchvision torchaudio -c pytorch -c nvidia -c conda-forge
+conda env create -f env.yml
 conda activate invasive-classifier
 ```
 
