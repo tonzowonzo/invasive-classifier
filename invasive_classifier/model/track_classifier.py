@@ -7,14 +7,17 @@ import torch.nn as nn
 
 try:
     import timm
+
     _HAS_TIMM = True
 except Exception:
     _HAS_TIMM = False
+
 
 # --- Configuration for the Detector ---
 @dataclass
 class DetectorConfig:
     """Configuration for the DinoV3 Object Detector."""
+
     num_classes: int  # Number of object classes (e.g., 1 for 'possum')
     backbone_name: str = "vit_base_patch16_224.dinov3.lvd142m"
     in_channels: int = 1  # Set to 1 for single-channel thermal images
@@ -24,12 +27,14 @@ class DetectorConfig:
     unfreeze_last_n_blocks: int = 0
     feature_dim_override: Optional[int] = None
 
+
 # --- A Simple Detection Head ---
 class SimpleDetectionHead(nn.Module):
     """
     A simple detection head that takes backbone features and predicts
     class logits and bounding boxes for each feature token.
     """
+
     def __init__(self, in_dim: int, num_classes: int):
         super().__init__()
         # We add +1 to num_classes for the "no object" or background class.
@@ -38,7 +43,7 @@ class SimpleDetectionHead(nn.Module):
         self.box_head = nn.Sequential(
             nn.Linear(in_dim, in_dim),
             nn.ReLU(),
-            nn.Linear(in_dim, 4)  # 4 values for bbox: (cx, cy, w, h)
+            nn.Linear(in_dim, 4),  # 4 values for bbox: (cx, cy, w, h)
         )
 
     def forward(self, feats: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -51,8 +56,11 @@ class SimpleDetectionHead(nn.Module):
             Dict[str, torch.Tensor]: A dictionary with 'pred_logits' and 'pred_boxes'.
         """
         pred_logits = self.class_head(feats)
-        pred_boxes = self.box_head(feats).sigmoid() # Sigmoid to keep box coords in [0, 1]
+        pred_boxes = self.box_head(
+            feats
+        ).sigmoid()  # Sigmoid to keep box coords in [0, 1]
         return {"pred_logits": pred_logits, "pred_boxes": pred_boxes}
+
 
 # --- The Main Detector Model ---
 class DinoV3ObjectDetector(nn.Module):
@@ -60,6 +68,7 @@ class DinoV3ObjectDetector(nn.Module):
     An object detector using a DINOv3 Vision Transformer backbone, adapted for
     single-channel thermal input.
     """
+
     def __init__(self, cfg: DetectorConfig):
         super().__init__()
         self.cfg = cfg
@@ -70,7 +79,9 @@ class DinoV3ObjectDetector(nn.Module):
         self.backbone = timm.create_model(
             cfg.backbone_name, pretrained=True, num_classes=0
         )
-        feat_dim = cfg.feature_dim_override or getattr(self.backbone, "num_features", 768)
+        feat_dim = cfg.feature_dim_override or getattr(
+            self.backbone, "num_features", 768
+        )
 
         # Adapt backbone for thermal (single-channel) input
         self._adapt_input_channels(cfg.in_channels)
@@ -84,7 +95,7 @@ class DinoV3ObjectDetector(nn.Module):
             if blocks is None:
                 raise ValueError("Backbone has no 'blocks' to unfreeze.")
             # Unfreeze the last N blocks
-            for b in blocks[-cfg.unfreeze_last_n_blocks:]:
+            for b in blocks[-cfg.unfreeze_last_n_blocks :]:
                 for p in b.parameters():
                     p.requires_grad = True
 
@@ -97,7 +108,7 @@ class DinoV3ObjectDetector(nn.Module):
         number of input channels.
         """
         if in_channels == 3:
-            return # No changes needed
+            return  # No changes needed
 
         patch_embed = self.backbone.patch_embed
         original_conv = patch_embed.proj
@@ -109,20 +120,21 @@ class DinoV3ObjectDetector(nn.Module):
             kernel_size=original_conv.kernel_size,
             stride=original_conv.stride,
             padding=original_conv.padding,
-            bias=(original_conv.bias is not None)
+            bias=(original_conv.bias is not None),
         )
 
         # A common heuristic to initialize the new weights is to average the
         # original RGB weights.
         with torch.no_grad():
-            new_conv.weight.data = original_conv.weight.data.mean(dim=1, keepdim=True).repeat(1, in_channels, 1, 1)
+            new_conv.weight.data = original_conv.weight.data.mean(
+                dim=1, keepdim=True
+            ).repeat(1, in_channels, 1, 1)
             if original_conv.bias is not None:
                 new_conv.bias.data = original_conv.bias.data
 
         # Replace the original patch embedding projection layer
         patch_embed.proj = new_conv
         print(f"✅ Backbone input layer adapted for {in_channels} channels.")
-
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """

@@ -2,13 +2,14 @@
 import csv
 from typing import Dict, List, Optional, Tuple
 
+
 def label_map_from_counts(
     csv_path: str,
     include_false_positive: bool = True,
     min_count: Optional[int] = None,  # set e.g. 10 to drop ultra-rare
     extra_classes: Optional[List[str]] = None,
-    sort_by: str = "name",            # "name" or "count"
-) -> Tuple[Dict[str,int], Dict[str,int]]:
+    sort_by: str = "name",  # "name" or "count"
+) -> Tuple[Dict[str, int], Dict[str, int]]:
     """
     Returns (label_map, counts_dict). Reads a CSV with columns ['label','count'].
     - include_false_positive: keep 'false-positive' class or drop it
@@ -16,15 +17,19 @@ def label_map_from_counts(
     - extra_classes: ensure these are included even if they don't meet min_count
     - sort_by: index order ('name' alphabetic or 'count' descending)
     """
-    counts: Dict[str,int] = {}
+    counts: Dict[str, int] = {}
     with open(csv_path, "r", newline="") as f:
         reader = csv.DictReader(f)
         # Accept variants of header names
         cols = {k.lower(): k for k in reader.fieldnames or []}
         lab_col = cols.get("label") or cols.get("class") or cols.get("category")
-        cnt_col = cols.get("count") or cols.get("n") or cols.get("num") or cols.get("samples")
+        cnt_col = (
+            cols.get("count") or cols.get("n") or cols.get("num") or cols.get("samples")
+        )
         if not (lab_col and cnt_col):
-            raise ValueError(f"CSV must have 'label' and 'count' columns; got: {reader.fieldnames}")
+            raise ValueError(
+                f"CSV must have 'label' and 'count' columns; got: {reader.fieldnames}"
+            )
 
         for row in reader:
             lab = (row[lab_col] or "").strip()

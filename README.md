@@ -2,7 +2,7 @@
 
 This is a WIP - I'll likely change the architecture significantly.
 
-This repository contains code and training utilities for building a **track-level classifier** of invasive species (e.g., possums, rodents, cats, hedgehogs) using thermal camera trap videos from **[The Cacophony Project](https://cacophony.org.nz/)**.  
+This repository contains code and training utilities for building a **track-level classifier** of invasive species (e.g., possums, rodents, cats, hedgehogs) using thermal camera trap videos from **[The Cacophony Project](https://cacophony.org.nz/)**.
 
 The goal is to support conservation by automatically detecting and classifying animals in thermal footage, enabling better monitoring and control of invasive species.
 
@@ -42,9 +42,9 @@ We build a **track-level classifier**:
   - GRU head (`gru`).
 - Outputs per-track species classification logits.
 
-Normalization:  
-- Grayscale frames are replicated to **3 channels**.  
-- Resized to **224×224**.  
+Normalization:
+- Grayscale frames are replicated to **3 channels**.
+- Resized to **224×224**.
 - Normalized with **ImageNet mean/std** (`0.485, 0.456, 0.406` / `0.229, 0.224, 0.225`) to match DINOv3 pretraining.
 
 ---
@@ -67,10 +67,10 @@ pip install poetry
 poetry install
 ```
 
-Key Python deps:  
-- `timm` (ViT + DINOv3 models)  
-- `torchvision`  
-- `opencv-python-headless`  
+Key Python deps:
+- `timm` (ViT + DINOv3 models)
+- `torchvision`
+- `opencv-python-headless`
 - `matplotlib`, `pandas`, `tqdm`, `tensorboard`
 
 ---
@@ -123,7 +123,7 @@ CFG = dict(
 
 ## License
 
-This repository is for research purposes. Dataset: **Community Data License Agreement (permissive variant)**.  
+This repository is for research purposes. Dataset: **Community Data License Agreement (permissive variant)**.
 See [The Cacophony Project](https://cacophony.org.nz/) for details.
 
 ---
