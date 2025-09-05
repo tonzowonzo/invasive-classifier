@@ -1,4 +1,3 @@
-# invasive_classifier/train/train.py
 import os
 import time
 from collections import Counter
@@ -10,7 +9,6 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-# --- Refactored Imports ---
 from invasive_classifier.config import get_config, get_class_mapping
 from invasive_classifier.data.data_utils import (
     apply_class_mapping,
@@ -99,8 +97,10 @@ def main():
             )
 
     # --- 3. Setup Model, Optimizer, and Loss ---
+    # --- FIX: Pass the 'size' from the config to the model builder ---
     model = build_dinov3_detector(
         num_classes=len(label_map),
+        img_size=CFG["size"],
         backbone_name="vit_base_patch16_224",
         in_channels=3,
         local_checkpoint=CFG["local_ckpt"],
@@ -115,7 +115,7 @@ def main():
     ]
     optimizer = optim.AdamW(groups, weight_decay=CFG["weight_decay"])
     sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CFG["epochs"])
-    scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
+    scaler = torch.amp.GradScaler(device, enabled=(device == "cuda"))
     criterion = nn.CrossEntropyLoss()
 
     # --- 4. Training Loop ---
@@ -131,7 +131,7 @@ def main():
         for xb, yb, meta in pbar:
             xb, yb = xb.to(device).float(), yb.to(device)
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=(device == "cuda")):
+            with torch.amp.autocast(device, enabled=(device == "cuda")):
                 B, T, C, H, W = xb.shape
                 xb_frames = xb.view(B * T, C, H, W)
                 predictions = model(xb_frames)

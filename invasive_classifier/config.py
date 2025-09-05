@@ -10,17 +10,17 @@ def get_config() -> Dict:
         out="artifacts_detector_merged",
         logdir="runs/invasive_detector_merged",
         epochs=10,
-        batch_size=4,
+        batch_size=8,
         num_workers=8,
-        num_samples=8,
-        size=224,
-        lr_head=1e-4,
+        num_samples=16,
+        size=128,
+        lr_head=1e-3,
         lr_backbone=5e-5,
         weight_decay=0.05,
         grad_clip=1.0,
         unfreeze_last_n_blocks=0,
         use_weighted_sampler=True,
-        debug_every_steps=250,
+        debug_every_steps=100,
     )
 
 

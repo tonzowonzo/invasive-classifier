@@ -79,7 +79,7 @@ class NZThermalTracksNoFiltered(Dataset):
         pad: int = 12,
         drop_calibration_frames: bool = True,
         normalize: str = "imagenet",
-        use_bboxes: bool = False,
+        use_bboxes: bool = True,
     ):
         self.root = root
         self.vdir = os.path.join(root, "videos")
