@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Dict
 
 import torch
 import torch.nn as nn
@@ -11,62 +11,71 @@ try:
 except Exception:
     _HAS_TIMM = False
 
-
+# --- Configuration for the Detector ---
 @dataclass
-class DinoV3Config:
-    num_classes: int
+class DetectorConfig:
+    """Configuration for the DinoV3 Object Detector."""
+    num_classes: int  # Number of object classes (e.g., 1 for 'possum')
     backbone_name: str = "vit_base_patch16_224.dinov3.lvd142m"
-    dropout: float = 0.2
-    temporal: str = "meanmax"   # ["meanmax", "gru"]
-    freeze_backbone: bool = True
+    in_channels: int = 1  # Set to 1 for single-channel thermal images
+    dropout: float = 0.1
+    # Freeze the backbone by default is NOT recommended for domain transfer.
+    freeze_backbone: bool = False
     unfreeze_last_n_blocks: int = 0
     feature_dim_override: Optional[int] = None
-    # keep inputs as-is (dataset handles normalization)
-    normalize_in_model: bool = False
-    norm_mean: Tuple[float, float, float] = (0.485, 0.456, 0.406)
-    norm_std:  Tuple[float, float, float] = (0.229, 0.224, 0.225)
 
-
-class TemporalMeanMaxHead(nn.Module):
-    def __init__(self, in_dim: int, num_classes: int, dropout: float = 0.2):
+# --- A Simple Detection Head ---
+class SimpleDetectionHead(nn.Module):
+    """
+    A simple detection head that takes backbone features and predicts
+    class logits and bounding boxes for each feature token.
+    """
+    def __init__(self, in_dim: int, num_classes: int):
         super().__init__()
-        self.classifier = nn.Sequential(
-            nn.Linear(in_dim * 2, 1024),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(1024, num_classes),
+        # We add +1 to num_classes for the "no object" or background class.
+        self.num_classes = num_classes
+        self.class_head = nn.Linear(in_dim, num_classes + 1)
+        self.box_head = nn.Sequential(
+            nn.Linear(in_dim, in_dim),
+            nn.ReLU(),
+            nn.Linear(in_dim, 4)  # 4 values for bbox: (cx, cy, w, h)
         )
 
-    def forward(self, feats: torch.Tensor) -> torch.Tensor:
-        mean = feats.mean(dim=1)
-        mx = feats.max(dim=1).values
-        return self.classifier(torch.cat([mean, mx], dim=1))
+    def forward(self, feats: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            feats (torch.Tensor): Features from the backbone of shape [B, N, D]
+                                  where N is the number of patches/tokens.
 
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary with 'pred_logits' and 'pred_boxes'.
+        """
+        pred_logits = self.class_head(feats)
+        pred_boxes = self.box_head(feats).sigmoid() # Sigmoid to keep box coords in [0, 1]
+        return {"pred_logits": pred_logits, "pred_boxes": pred_boxes}
 
-class TemporalGRUHead(nn.Module):
-    def __init__(self, in_dim: int, num_classes: int, hidden: int = 512, dropout: float = 0.2):
-        super().__init__()
-        self.gru = nn.GRU(input_size=in_dim, hidden_size=hidden, num_layers=1,
-                          batch_first=True, bidirectional=False)
-        self.classifier = nn.Sequential(nn.Dropout(dropout), nn.Linear(hidden, num_classes))
-
-    def forward(self, feats: torch.Tensor) -> torch.Tensor:
-        _, h = self.gru(feats)        # h: [1, B, H]
-        return self.classifier(h[-1]) # [B, H] -> [B, C]
-
-
-class DinoV3TrackClassifier(nn.Module):
-    def __init__(self, cfg: DinoV3Config):
+# --- The Main Detector Model ---
+class DinoV3ObjectDetector(nn.Module):
+    """
+    An object detector using a DINOv3 Vision Transformer backbone, adapted for
+    single-channel thermal input.
+    """
+    def __init__(self, cfg: DetectorConfig):
         super().__init__()
         self.cfg = cfg
         if not _HAS_TIMM:
             raise ImportError("timm is required (`pip install timm`).")
 
-        # backbone without classifier head
-        self.backbone = timm.create_model(cfg.backbone_name, pretrained=True, num_classes=0)
+        # Create backbone without its original classifier head
+        self.backbone = timm.create_model(
+            cfg.backbone_name, pretrained=True, num_classes=0
+        )
         feat_dim = cfg.feature_dim_override or getattr(self.backbone, "num_features", 768)
 
-        # (un)freeze
+        # Adapt backbone for thermal (single-channel) input
+        self._adapt_input_channels(cfg.in_channels)
+
+        # (Un)freeze backbone layers
         if cfg.freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
@@ -74,71 +83,95 @@ class DinoV3TrackClassifier(nn.Module):
             blocks = getattr(self.backbone, "blocks", None)
             if blocks is None:
                 raise ValueError("Backbone has no 'blocks' to unfreeze.")
+            # Unfreeze the last N blocks
             for b in blocks[-cfg.unfreeze_last_n_blocks:]:
                 for p in b.parameters():
                     p.requires_grad = True
 
-        # temporal head
-        if cfg.temporal.lower() == "gru":
-            self.temporal = TemporalGRUHead(feat_dim, cfg.num_classes, hidden=512, dropout=cfg.dropout)
-        else:
-            self.temporal = TemporalMeanMaxHead(feat_dim, cfg.num_classes, dropout=cfg.dropout)
+        # Create the detection head
+        self.detection_head = SimpleDetectionHead(feat_dim, cfg.num_classes)
 
-        # optional in-model normalization (off by default)
-        if cfg.normalize_in_model:
-            self.register_buffer("mean", torch.tensor(cfg.norm_mean).view(1, 1, 3, 1, 1))
-            self.register_buffer("std",  torch.tensor(cfg.norm_std).view(1, 1, 3, 1, 1))
-        else:
-            self.mean = None
-            self.std = None
+    def _adapt_input_channels(self, in_channels: int):
+        """
+        Modifies the first layer of the ViT backbone to accept a different
+        number of input channels.
+        """
+        if in_channels == 3:
+            return # No changes needed
 
-    @torch.no_grad()
-    def _extract_frame_features(self, frames: torch.Tensor) -> torch.Tensor:
-        return self.backbone(frames)  # [N, D]
+        patch_embed = self.backbone.patch_embed
+        original_conv = patch_embed.proj
 
-    def _backbone_requires_grad(self) -> bool:
-        return any(p.requires_grad for p in self.backbone.parameters())
+        # Create a new Conv2d layer with the desired number of input channels
+        new_conv = nn.Conv2d(
+            in_channels,
+            original_conv.out_channels,
+            kernel_size=original_conv.kernel_size,
+            stride=original_conv.stride,
+            padding=original_conv.padding,
+            bias=(original_conv.bias is not None)
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, 3, H, W] already normalized by dataset
-        B, T, C, H, W = x.shape
-        if (self.mean is not None) and (self.std is not None):
-            x = (x - self.mean) / (self.std + 1e-6)
+        # A common heuristic to initialize the new weights is to average the
+        # original RGB weights.
+        with torch.no_grad():
+            new_conv.weight.data = original_conv.weight.data.mean(dim=1, keepdim=True).repeat(1, in_channels, 1, 1)
+            if original_conv.bias is not None:
+                new_conv.bias.data = original_conv.bias.data
 
-        x = x.view(B * T, C, H, W)
-        with torch.set_grad_enabled(self._backbone_requires_grad()):
-            feats = self._extract_frame_features(x)  # [B*T, D]
-        feats = feats.view(B, T, -1)                 # [B, T, D]
-        return self.temporal(feats)                  # [B, num_classes]
+        # Replace the original patch embedding projection layer
+        patch_embed.proj = new_conv
+        print(f"✅ Backbone input layer adapted for {in_channels} channels.")
 
 
-# ---- factory ----
-def build_dinov3_track_classifier(
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass for a batch of frames.
+
+        Args:
+            x (torch.Tensor): A batch of images, shape [B, C, H, W].
+                              For thermal, C=1.
+
+        Returns:
+            Dict[str, torch.Tensor]: Predictions from the detection head.
+        """
+        # Get patch features from the backbone. This returns tokens,
+        # including the [CLS] token at the beginning.
+        # Shape: [B, num_patches + 1, feature_dim]
+        feats = self.backbone.forward_features(x)
+
+        # We typically discard the [CLS] token for detection tasks
+        patch_tokens = feats[:, 1:, :]
+
+        # Get predictions from the detection head
+        return self.detection_head(patch_tokens)
+
+
+# ---- Factory Function to Build the Detector ----
+def build_dinov3_detector(
     num_classes: int,
-    backbone_name: str = "vit_base_patch16_224",
-    temporal: str = "meanmax",
-    freeze_backbone: bool = True,
+    backbone_name: str = "vit_base_patch16_224.dinov3.lvd142m",
+    in_channels: int = 1,
+    freeze_backbone: bool = False,
     unfreeze_last_n_blocks: int = 0,
-    dropout: float = 0.2,
     local_checkpoint: Optional[str] = None,
-    normalize_in_model: bool = False,
-) -> DinoV3TrackClassifier:
-    cfg = DinoV3Config(
+) -> DinoV3ObjectDetector:
+    """
+    Helper factory function to build the DinoV3ObjectDetector.
+    """
+    cfg = DetectorConfig(
         num_classes=num_classes,
         backbone_name=backbone_name,
-        temporal=temporal,
+        in_channels=in_channels,
         freeze_backbone=freeze_backbone,
         unfreeze_last_n_blocks=unfreeze_last_n_blocks,
-        dropout=dropout,
-        normalize_in_model=normalize_in_model,
     )
-    model = DinoV3TrackClassifier(cfg)
+    model = DinoV3ObjectDetector(cfg)
 
-    # optional local DINOv3 backbone weights
+    # Optional: load local DINOv3 backbone weights if needed
     if local_checkpoint and os.path.isfile(local_checkpoint):
         sd = torch.load(local_checkpoint, map_location="cpu")
         missing, unexpected = model.backbone.load_state_dict(sd, strict=False)
         print(f"[DINOv3] Loaded local checkpoint: {local_checkpoint}")
         print(f"[DINOv3] missing={len(missing)} unexpected={len(unexpected)}")
-
     return model

@@ -1,4 +1,3 @@
-# invasive_classifier/data/dataset.py
 import os, json, glob
 from collections import Counter, defaultdict
 from typing import List, Dict, Tuple, Optional, Set
@@ -53,30 +52,21 @@ IMAGENET_NORM = T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225
 # -------------------- dataset --------------------
 
 class NZThermalTracksNoFiltered(Dataset):
-    """
-    root/
-      videos/                 # <id>.mp4 (we ignore *_filtered.mp4)
-      individual-metadata/    # <id>_metadata.json (with 'points')
-      new-zealand-wildlife-thermal-imaging.json (optional)
-
-    Returns:
-      x: [T, 3, H, W] (float32, ImageNet-normalized if normalize='imagenet')
-      y: int64
-      meta: dict
-    """
     def __init__(
         self,
         root: str,
         num_samples: int = 24,
         size: int = 224,
         label_map: Optional[Dict[str,int]] = None,
+        # --- MODIFICATION: Added class_mapping ---
+        class_mapping: Optional[Dict[str, str]] = None,
         allowed_clip_ids: Optional[Set[int]] = None,
         include_false_positive: bool = True,
         min_track_len: int = 4,
         pad: int = 12,
         drop_calibration_frames: bool = True,
-        normalize: str = "imagenet",   # "imagenet" or "none"
-        use_bboxes: bool = False       # <--- NEW: off by default (use full frame)
+        normalize: str = "imagenet",
+        use_bboxes: bool = False
     ):
         self.root = root
         self.vdir = os.path.join(root, "videos")
@@ -85,6 +75,8 @@ class NZThermalTracksNoFiltered(Dataset):
         self.pad = pad
         self.drop_calibration_frames = drop_calibration_frames
         self.use_bboxes = use_bboxes
+        # --- MODIFICATION: Store the mapping ---
+        self.class_mapping = class_mapping or {}
 
         norm = (normalize or "none").lower()
         if norm == "imagenet":
@@ -98,23 +90,9 @@ class NZThermalTracksNoFiltered(Dataset):
         if not metas:
             raise FileNotFoundError("No *_metadata.json found in individual-metadata/")
 
-        # build label_map if not given
         if label_map is None:
-            seen = []
-            for p in metas[:5000]:
-                try:
-                    m = json.load(open(p))
-                    for tr in m.get("tracks", []):
-                        lab = choose_label(tr.get("tags", []))
-                        if lab: seen.append(lab)
-                except Exception:
-                    pass
-            classes = sorted(set(seen))
-            if not include_false_positive:
-                classes = [c for c in classes if "false" not in c.lower()]
-            self.label_map = {c:i for i,c in enumerate(classes)}
-        else:
-            self.label_map = label_map
+            raise ValueError("A label_map must be provided.")
+        self.label_map = label_map
 
         # index items
         self.items = []
@@ -136,12 +114,20 @@ class NZThermalTracksNoFiltered(Dataset):
             calib = set(m.get("calibration_frames", []) or [])
 
             for ti, tr in enumerate(m.get("tracks", [])):
-                lab = choose_label(tr.get("tags", []))
-                if not lab or lab not in self.label_map:
+                lab_raw = choose_label(tr.get("tags", []))
+                if not lab_raw:
                     continue
+
+                # --- MODIFICATION: Apply class mapping here ---
+                lab = self.class_mapping.get(lab_raw, lab_raw)
+
+                if lab not in self.label_map:
+                    continue
+                if not include_false_positive and "false" in lab.lower():
+                    continue
+
                 pts = tr.get("points", [])
-                if not pts:
-                    continue
+                if not pts: continue
                 pts = [(int(p[0]), int(p[1]), int(p[2])) for p in pts]
                 boxes = boxes_from_points(pts, self.pad, W, H)
                 frames = sorted(boxes.keys())
@@ -149,6 +135,7 @@ class NZThermalTracksNoFiltered(Dataset):
                     frames = [f for f in frames if f not in calib]
                 if len(frames) < min_track_len:
                     continue
+
                 self.items.append({
                     "video": vpath,
                     "boxes": boxes, "frames": frames,
@@ -158,7 +145,7 @@ class NZThermalTracksNoFiltered(Dataset):
                 })
 
         if not self.items:
-            raise RuntimeError("No usable tracks found (maybe only _filtered.mp4 present?).")
+            raise RuntimeError("No usable tracks found after filtering.")
 
     def __len__(self): return len(self.items)
 
@@ -166,9 +153,8 @@ class NZThermalTracksNoFiltered(Dataset):
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(fidx))
         ok, frame = cap.read()
         if not ok: return None
-        # grayscale -> replicate to 3 channels (model expects 3ch)
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        frame = np.stack([frame, frame, frame], axis=2)  # H,W,3
+        frame = np.stack([frame, frame, frame], axis=2)
         return frame
 
     def __getitem__(self, i):
@@ -184,31 +170,30 @@ class NZThermalTracksNoFiltered(Dataset):
             if frame is None:
                 frame = np.zeros((it["H"], it["W"], 3), dtype=np.uint8)
 
-            # --- NEW: bbox use is optional ---
             if self.use_bboxes:
                 x1,y1,x2,y2 = it["boxes"].get(f, (0,0,it["W"],it["H"]))
                 crop = frame[y1:y2, x1:x2]
                 if crop.size == 0:
                     crop = frame
             else:
-                crop = frame  # use full frame
+                crop = frame
 
             crop = cv2.resize(crop, (self.size, self.size), interpolation=cv2.INTER_AREA)
             crop = crop.astype(np.float32) / 255.0
-            tensor = torch.from_numpy(crop).permute(2,0,1)  # [3,H,W] in [0,1]
+            tensor = torch.from_numpy(crop).permute(2,0,1)
             if self.normalizer is not None:
                 tensor = self.normalizer(tensor)
             crops.append(tensor)
         cap.release()
 
-        x = torch.stack(crops, 0)  # [T,3,H,W]
+        x = torch.stack(crops, 0)
         y = torch.tensor(it["label_id"]).long()
         meta = {
             "label_str": it["label_str"],
             "clip_id": it["clip_id"],
             "track_index": it["track_index"],
             "video_path": it["video"],
-            "frames": idxs,            # helpful for debug panels
+            "frames": idxs,
         }
         return x, y, meta
 
@@ -216,6 +201,7 @@ class NZThermalTracksNoFiltered(Dataset):
 # -------------------- loader factory --------------------
 
 def make_loader(root, batch_size=8, num_workers=4, **kwargs):
+    # This function now correctly passes `class_mapping` through via **kwargs
     ds = NZThermalTracksNoFiltered(root, **kwargs)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True,
                     num_workers=num_workers, pin_memory=True)
